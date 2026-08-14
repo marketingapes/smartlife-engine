@@ -359,6 +359,11 @@ async def push_calltools(lead_id):
                              json=payload, timeout=30)
         r.raise_for_status()
         ct_id = r.json().get("id")
+        # phone doesn't attach on create — PATCH phone_number_1 to create the dialable number
+        async with httpx.AsyncClient() as c:
+            await c.patch(f"{CALLTOOLS_BASE}/contacts/{ct_id}/",
+                          headers={"Authorization": f"Token {CALLTOOLS_KEY}"},
+                          json={"phone_number_1": lead["phone"]}, timeout=30)
         await pool.execute("UPDATE leads SET meta = meta || $2::jsonb WHERE id=$1",
                            lead_id, json.dumps({"calltools_id": ct_id}))
         await log_event(lead_id, "calltools_pushed", {"calltools_id": ct_id})
@@ -410,7 +415,8 @@ async def startup():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "vapi_enabled": VAPI_ENABLED,
+    return {"ok": True, "vapi_enabled": VAPI_ENABLED, "calltools": bool(CALLTOOLS_KEY),
+            "voicemail_on_final": VOICEMAIL_ON_FINAL,
             "email_provider": "gmail" if (EMAIL_PROVIDER == "gmail" and GMAIL_APP_PASSWORD) else "ses",
             "time_pt": datetime.now(PT).isoformat()}
 
@@ -491,7 +497,7 @@ async def twilio_inbound(request: Request):
     if "yes" in body.split() or body == "yes":
         if lead_id:
             await pool.execute("UPDATE leads SET status='hot_reply' WHERE id=$1", lead_id)
-        await alert_team("🔥 SmartLife HOT lead replied YES",
+        await alert_team("HOT SmartLife lead replied YES",
                          f"{(lead['first_name'] + ' ' + (lead['last_name'] or '')).strip() if lead else frm} · {frm}\n"
                          f"They want a call NOW. Call from the team line.", lead_id)
     else:
@@ -525,7 +531,7 @@ async def vapi_webhook(request: Request):
     elif routing in ("transferred", "team_handoff_now"):
         await pool.execute("UPDATE leads SET status='transferred' WHERE id=$1", lead_id)
         await cancel_remaining(lead_id)
-        await alert_team("✅ SmartLife lead transferred to team",
+        await alert_team("SmartLife lead transferred to team",
                          f"{sd.get('first_name','')} {sd.get('last_name','')} · {phone}", lead_id)
     elif routing == "callback_scheduled":
         await pool.execute("UPDATE leads SET status='callback_scheduled' WHERE id=$1", lead_id)
@@ -533,7 +539,7 @@ async def vapi_webhook(request: Request):
                            lead_id, sd.get("callback_window", ""))
         asyncio.create_task(update_calltools(lead_id, {"besttimeforcallback": sd.get("callback_window", "")}))
         await cancel_remaining(lead_id, ["sms", "call"])  # keep the email nurture
-        await alert_team("📅 SmartLife callback booked",
+        await alert_team("SmartLife callback booked",
                          f"{sd.get('first_name','')} · {phone}\nWindow: {sd.get('callback_window','?')}", lead_id)
     elif routing in ("not_interested", "wrong_person"):
         await pool.execute("UPDATE leads SET status=$2 WHERE id=$1", lead_id, routing)
@@ -600,6 +606,15 @@ async def list_leads(request: Request, limit: int = 50):
         "SELECT id, created_at, source, first_name, last_name, phone, email, state, age_band, status "
         "FROM leads ORDER BY created_at DESC LIMIT $1", min(limit, 200))
     return [dict(r) | {"created_at": r["created_at"].isoformat()} for r in rows]
+
+
+@app.get("/events")
+async def list_events(request: Request, limit: int = 100):
+    check_token(request)
+    rows = await pool.fetch(
+        "SELECT lead_id, ts, type, payload FROM events ORDER BY ts DESC LIMIT $1", min(limit, 500))
+    return [{"lead_id": r["lead_id"], "ts": r["ts"].isoformat(), "type": r["type"],
+             "payload": json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]} for r in rows]
 
 
 # ---------------------------------------------------------------- scheduler
