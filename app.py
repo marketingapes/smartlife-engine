@@ -28,7 +28,7 @@ TWILIO_ACCOUNT_SID = ENV.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_API_KEY = ENV.get("TWILIO_API_KEY", "")
 TWILIO_API_SECRET = ENV.get("TWILIO_API_SECRET", "")
 TWILIO_MESSAGING_SERVICE_SID = ENV.get("TWILIO_MESSAGING_SERVICE_SID", "")
-SMS_FROM = ENV.get("SMS_FROM", "+12135137977")
+SMS_FROM = ENV.get("SMS_FROM", "")  # fail-closed: no default sender; send_sms refuses when unset
 
 AWS_REGION = ENV.get("SES_REGION", "us-east-2")
 SES_CONFIG_SET = ENV.get("SES_CONFIG_SET", "smartlife-fe")
@@ -195,6 +195,8 @@ async def cancel_remaining(lead_id, channels=None):
 
 # ---------------------------------------------------------------- senders
 async def send_sms(to, body):
+    if not SMS_FROM:
+        raise RuntimeError("SMS_FROM is not configured - refusing to send SMS (fail-closed)")
     auth = (TWILIO_API_KEY, TWILIO_API_SECRET)
     data = {"To": to, "Body": body}
     if TWILIO_MESSAGING_SERVICE_SID:
