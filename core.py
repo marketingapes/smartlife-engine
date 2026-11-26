@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request, Response, HTTPException
 ENV = os.environ
 DATABASE_URL = ENV["DATABASE_URL"]
 WEBHOOK_TOKEN = ENV.get("WEBHOOK_TOKEN", "")
+OUTREACH_ENABLED = ENV.get("OUTREACH_ENABLED", "").lower() == "true"
 
 TWILIO_ACCOUNT_SID = ENV.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_API_KEY = ENV.get("TWILIO_API_KEY", "")
@@ -188,8 +189,10 @@ def in_window(start, end, weekdays_only=False):
 
 
 def check_token(request: Request):
+    if not WEBHOOK_TOKEN:
+        raise HTTPException(503, "webhook token is not configured")
     tok = request.query_params.get("token") or request.headers.get("x-webhook-token", "")
-    if WEBHOOK_TOKEN and tok != WEBHOOK_TOKEN:
+    if tok != WEBHOOK_TOKEN:
         raise HTTPException(403, "bad token")
 
 
@@ -339,7 +342,7 @@ async def place_sofia_call(lead, leave_voicemail=False):
 
 async def push_calltools(lead_id):
     """Layer 4: mirror the lead into CallTools so agents can work it. Never blocks the sequence."""
-    if not CALLTOOLS_KEY:
+    if not OUTREACH_ENABLED or not CALLTOOLS_KEY:
         return
     try:
         lead = await pool.fetchrow("SELECT * FROM leads WHERE id=$1", lead_id)
@@ -373,7 +376,7 @@ async def push_calltools(lead_id):
 
 async def update_calltools(lead_id, fields):
     """Update the mirrored CallTools contact (callback window, DNC, etc.)."""
-    if not CALLTOOLS_KEY:
+    if not CALLTOOLS_KEY or (not OUTREACH_ENABLED and fields != {"do_not_contact": True}):
         return
     try:
         meta = await pool.fetchval("SELECT meta FROM leads WHERE id=$1", lead_id)
@@ -390,6 +393,8 @@ async def update_calltools(lead_id, fields):
 
 
 async def alert_team(subject, body, lead_id=None):
+    if not OUTREACH_ENABLED:
+        return
     for n in TEAM_ALERT_SMS:
         try:
             await send_sms(n, f"{subject}\n{body}"[:1500])
@@ -410,12 +415,14 @@ async def startup():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     await pool.execute(SCHEMA)
-    asyncio.create_task(scheduler_loop())
+    if OUTREACH_ENABLED:
+        asyncio.create_task(scheduler_loop())
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "vapi_enabled": VAPI_ENABLED, "calltools": bool(CALLTOOLS_KEY),
+    return {"ok": True, "outreach_enabled": OUTREACH_ENABLED,
+            "vapi_enabled": VAPI_ENABLED, "calltools": bool(CALLTOOLS_KEY),
             "voicemail_on_final": VOICEMAIL_ON_FINAL,
             "email_provider": "gmail" if (EMAIL_PROVIDER == "gmail" and GMAIL_APP_PASSWORD) else "ses",
             "time_pt": datetime.now(PT).isoformat()}
@@ -453,16 +460,21 @@ async def webhook_lead(request: Request):
     dup = await pool.fetchrow(
         "SELECT id FROM leads WHERE phone=$1 AND phone IS NOT NULL AND created_at > now() - interval '30 days' LIMIT 1", phone)
     unsub = secrets.token_urlsafe(16)
+    status = "in_sequence" if OUTREACH_ENABLED else "outreach_held"
     lead_id = await pool.fetchval(
-        "INSERT INTO leads (source, first_name, last_name, phone, email, state, age_band, unsub_token, meta) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
-        source, first, last, phone, email, state, age_band, unsub, json.dumps(data))
+        "INSERT INTO leads (source, first_name, last_name, phone, email, state, age_band, status, unsub_token, meta) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
+        source, first, last, phone, email, state, age_band, status, unsub, json.dumps(data))
     await log_event(lead_id, "lead_received", data)
 
     if dup:
         await pool.execute("UPDATE leads SET status='duplicate' WHERE id=$1", lead_id)
         await log_event(lead_id, "duplicate_of", {"lead_id": dup["id"]})
         return {"ok": True, "lead_id": lead_id, "duplicate": True}
+
+    if not OUTREACH_ENABLED:
+        await log_event(lead_id, "outreach_held")
+        return {"ok": True, "lead_id": lead_id, "outreach_held": True}
 
     base = now()
     for step, channel, delay in SEQUENCE:

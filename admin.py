@@ -5,7 +5,7 @@ Run: uvicorn admin:app
 """
 import core
 from core import app, send_email_raw, check_token, PUBLIC_BASE_URL
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 
 def _render(s, first_name, unsub_url):
@@ -23,6 +23,8 @@ async def broadcast_email(request: Request):
     statuses = body.get("statuses", ["in_sequence", "hot_reply"])
     lead_ids = body.get("lead_ids")
     dry_run = bool(body.get("dry_run"))
+    if not dry_run and not core.OUTREACH_ENABLED:
+        raise HTTPException(409, "outreach is paused")
 
     rows = await core.pool.fetch(
         "SELECT * FROM leads WHERE email IS NOT NULL AND email <> '' AND status = ANY($1) ORDER BY id", statuses)
